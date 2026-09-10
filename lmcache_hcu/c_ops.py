@@ -38,6 +38,13 @@ _MEM_KERNEL_OVERRIDES = {
     "lmcache_memcpy_async",
 }
 
+# TransferDirection and GPUKVFormat are intentionally NOT overridden here.
+# They are registered by the baseline lmcache.c_ops extension and must be
+# sourced from the baseline (via __getattr__ fallback) so that pybind11
+# does not throw "already registered" when the HCU native extension loads.
+# The HCU native kernel functions accept the baseline enum values because
+# pybind11 resolves enum casters globally by C++ type identity.
+
 
 def _set_base_c_ops(module: ModuleType | None) -> None:
     """Inject the baseline lmcache.c_ops so non-mem-kernel calls can fall back."""

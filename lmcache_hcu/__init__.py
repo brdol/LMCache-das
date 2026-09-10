@@ -24,7 +24,7 @@ from typing import Optional, Any, List, Union
 import torch
 
 logger = init_logger(__name__)
-LMCACHE_UPSTREAM_TAG = "v0.3.13"
+LMCACHE_UPSTREAM_TAG = "v0.4.2"
 LMCACHE_HCU_PATCHED = False
 
 
@@ -107,6 +107,21 @@ def _patch_vllm_paged_mem_gpu_connector_v2() -> None:
     base_gpu_connector.VLLMBufferLayerwiseGPUConnector = HCUVLLMBufferLayerwiseGPUConnector
     base_gpu_connector.VLLMPagedMemLayerwiseGPUConnector = HCUVLLMPagedMemLayerwiseGPUConnector
 
+    # CreateGPUConnector() does `from lmcache.v1.gpu_connector.gpu_connectors
+    # import VLLMPagedMemGPUConnectorV2, ...` INSIDE the function body, so
+    # rebinding only the package-level name is not enough: the submodule
+    # attributes must be rebound too, otherwise CreateGPUConnector still
+    # resolves the baseline V2 and crashes on DCU's (K, V) tuple kv caches
+    # ("'tuple' object has no attribute 'device'").
+    import lmcache.v1.gpu_connector.gpu_connectors as _gpu_connectors_mod
+    _gpu_connectors_mod.VLLMPagedMemGPUConnectorV2 = VLLMPagedMemHCUConnectorV2
+    _gpu_connectors_mod.VLLMBufferLayerwiseGPUConnector = (
+        HCUVLLMBufferLayerwiseGPUConnector
+    )
+    _gpu_connectors_mod.VLLMPagedMemLayerwiseGPUConnector = (
+        HCUVLLMPagedMemLayerwiseGPUConnector
+    )
+
 
     # Rebind the class in already-imported caller modules that pulled it into
     # their own namespace via `from lmcache.v1.gpu_connector import ...`.
@@ -119,74 +134,7 @@ def _patch_vllm_paged_mem_gpu_connector_v2() -> None:
             mod.VLLMPagedMemGPUConnectorV2 = VLLMPagedMemHCUConnectorV2
 
 
-def _hcu_get_shapes(self, num_tokens: Optional[int] = None) -> list[torch.Size]:
-    """Get the shapes of the KV cache in LMCache"""
-    if num_tokens is None:
-        num_tokens = self.chunk_size
-    if self.kv_layer_groups_manager.kv_layer_groups:
-        shapes = []
-        kv_size = 1 if self.use_mla else 2
-        for group in self.kv_layer_groups_manager.kv_layer_groups:
-            hidden_dim = group.hidden_dim_size(self.use_mla)
-            shapes.append(
-                torch.Size(
-                    [
-                        kv_size,
-                        group.num_layers,
-                        num_tokens,
-                        hidden_dim,
-                    ]
-                )
-            )
-        return shapes
-    else:
-        return [
-            torch.Size(
-                [
-                    self.kv_shape[1],
-                    self.kv_shape[0],
-                    num_tokens,
-                    self.kv_shape[3] * self.kv_shape[4],
-                ]
-            )
-        ]
-
-def _patch_metadata_get_shapes() -> None:
-
-    logger.info("Apply hcu metadata get_shapes patch.")
-
-    import lmcache.v1.metadata
-
-    lmcache.v1.metadata.LMCacheMetadata.get_shapes = _hcu_get_shapes
-
-
-def _hcu_hidden_dim_size(self, use_mla: bool) -> int:  # noqa: F841  # bound onto KVLayerGroupInfo at patch time
-    """HCU replacement for KVLayerGroupInfo.hidden_dim_size.
-
-    Extends the baseline to also handle the vLLM FlashAttention PA layout,
-    where the KV cache tensor for a group has shape
-    ``[num_blocks, block_size, num_heads, head_size]`` (4-dim) instead of
-    the baseline's ``[2, num_blocks, block_size, num_heads, head_size]`` (MHA)
-    or ``[num_blocks, block_size, head_size]`` (MLA).
-    """
-    import vllm.envs as envs
-
-    if envs.VLLM_USE_FLASH_ATTN_PA and not use_mla:
-        if len(self.shape) == 4:
-            # FlashAttention PA: [num_blocks, block_size, num_heads, head_size]
-            return self.shape[1] * self.shape[3]
-        raise ValueError(f"Invalid shape for FlashAttention PA: {self.shape}")
-
-    if len(self.shape) == 5:
-        # MHA: [2, num_blocks, block_size, num_heads, head_size]
-        return self.shape[3] * self.shape[4]
-    if len(self.shape) == 3:
-        # MLA: [num_blocks, block_size, head_size]
-        return self.shape[2]
-    raise ValueError(f"Invalid shape: {self.shape}")
-
-
-def _hcu_build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor], use_mla: bool) -> None:
+def _hcu_build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor]) -> None:
     """Build KV layer groups structure by analyzing each layer's shape and dtype.
 
     Layers with the same shape and dtype are grouped together. This is useful
@@ -202,12 +150,17 @@ def _hcu_build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor], use_mla
     # Skip if already built (non-empty list)
     from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
     from collections import defaultdict
-    import vllm.envs as envs
+    import os
     if len(self.kv_layer_groups) > 0:
         return
 
     if len(kv_caches) == 0:
         logger.debug("No KV caches available, skipping KV layer groups building")
+        return
+
+    env_value = os.environ.get("VLLM_HCU_USE_CUSTOM_FLASH_ATTN", "false")
+    if self.str_to_bool(env_value):
+        logger.debug("VLLM_HCU_USE_CUSTOM_FLASH_ATTN is true, skipping KV layer groups building")
         return
 
     # Group layers by (shape, dtype) in a single loop
@@ -216,12 +169,17 @@ def _hcu_build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor], use_mla
     )
 
     for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
-        if envs.VLLM_USE_FLASH_ATTN_PA and not use_mla:
-            shape = kv_cache[0].shape
-            dtype = kv_cache[0].dtype
+        # A combined layer is a single tensor [nb, 2, bs, nh, hs] whose shape
+        # is used directly. On DCU vLLM a standard attention layer is a raw
+        # (K, V) tuple of SEPARATE tensors (K = [nb, nh, bs, hs]); synthesize
+        # the same canonical [nb, 2, bs, nh, hs] so grouping and
+        # hidden_dim_size (= nh*hs) match.
+        if isinstance(kv_cache, torch.Tensor):
+            shape, dtype = kv_cache.shape, kv_cache.dtype
         else:
-            shape = kv_cache.shape
-            dtype = kv_cache.dtype
+            k = kv_cache[0]
+            nb, nh, bs, hs = k.shape
+            shape, dtype = torch.Size([nb, 2, bs, nh, hs]), k.dtype
         key = (shape, dtype)
         groups_dict[key].append((layer_name, idx))
 
@@ -257,15 +215,21 @@ def _hcu_build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor], use_mla
     # Print the group structure
     logger.info("KV layer groups: %s", kv_layer_groups)
 
+def _hcu_str_to_bool(self, val: str) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.lower() in ('true', '1', 'yes', 'on')
+    return False
+
+
 def _patch_kv_layer_groups():
 
     logger.info("Apply hcu kv_layer_groups patch.")
 
-    from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
+    from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 
-    KVLayerGroupInfo.hidden_dim_size = (
-        _hcu_hidden_dim_size
-    )
+    KVLayerGroupsManager.str_to_bool = _hcu_str_to_bool
     KVLayerGroupsManager.build_kv_layer_groups = (
         _hcu_build_kv_layer_groups
     )
@@ -278,9 +242,7 @@ def _hcu_lmcache_connector_build_kv_layer_groups(self):
         kv_layer_groups_manager = (
             self.lmcache_engine.metadata.kv_layer_groups_manager
         )
-        vllm_config = self._vllm_config
-        use_mla = vllm_config.model_config.use_mla if vllm_config.model_config else False
-        kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches, use_mla)
+        kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
 
 def _hcu_flatten_block_ids(block_ids):
@@ -587,8 +549,13 @@ def _patch_storage_backends() -> None:
             loop,
             dst_device: str = "cuda",
             lmcache_worker= None,
+            skip_backends=None,
+            existing_backends=None,
     ):
-        backends = original_create(config, metadata, loop, dst_device, lmcache_worker)
+        backends = original_create(
+            config, metadata, loop, dst_device, lmcache_worker,
+            skip_backends, existing_backends,
+        )
         if getattr(config, "xds_path", None) is None or "XdsBackend" in backends:
             return backends
 
@@ -777,6 +744,173 @@ def _patch_storage_manager_touch_cache() -> None:
     storage_manager_cls.touch_cache = touch_cache_with_xds
 
 
+def _patch_pq_executor() -> None:
+    """Port GL 0.4.2-dcu pq_executor hardening: reject new jobs after close."""
+    logger.info("Apply HCU pq_executor patch.")
+    try:
+        from lmcache.v1.storage_backend.job_executor.pq_executor import (
+            AsyncPQExecutor,
+            AsyncPQThreadPoolExecutor,
+        )
+    except Exception as exc:
+        logger.warning("Skip pq_executor patch (import failed): %s", exc)
+        return
+
+    for cls in (AsyncPQExecutor, AsyncPQThreadPoolExecutor):
+        original_submit = cls.submit_job
+        if getattr(original_submit, "_lmcache_hcu_pq_closed_guard", False):
+            continue
+
+        async def _guarded_submit_job(self, fn, *args, **kwargs):
+            if getattr(self, "_closed", False):
+                raise RuntimeError("priority executor is closed")
+            return await original_submit(self, fn, *args, **kwargs)
+
+        _guarded_submit_job._lmcache_hcu_pq_closed_guard = True
+        cls.submit_job = _guarded_submit_job
+
+
+def _patch_storage_manager_close() -> None:
+    """Port GL 0.4.2-dcu StorageManager.close: reverse-order + re-raise first error."""
+    logger.info("Apply HCU storage manager close patch.")
+    try:
+        import lmcache.v1.storage_backend.storage_manager as storage_manager
+    except Exception as exc:
+        logger.warning("Skip StorageManager close patch (import failed): %s", exc)
+        return
+
+    storage_manager_cls = storage_manager.StorageManager
+    original_close = storage_manager_cls.close
+    if getattr(original_close, "_lmcache_hcu_close_patched", False):
+        return
+
+    def _hcu_close(self):
+        logger.info("Closing StorageManager...")
+        close_error = None
+        shared_allocator_backends = {"LocalCPUBackend", "PDBackend"}
+        for name, backend in reversed(self.storage_backends.items()):
+            if close_error is not None and name in shared_allocator_backends:
+                logger.warning(
+                    "Skipping close of shared allocator backend %s after an "
+                    "earlier close failure",
+                    name,
+                )
+                continue
+            try:
+                logger.info(f"Closing storage backend: {name}")
+                backend.close()
+                logger.info(f"Storage backend {name} closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing backend {name}: {e}")
+                if close_error is None:
+                    close_error = e
+
+        try:
+            if self.loop.is_running():
+                self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception as e:
+            logger.error(f"Error stopping event loop: {e}")
+
+        if self.thread.is_alive():
+            self.thread.join(timeout=10.0)
+
+        if close_error is not None:
+            raise close_error
+
+        logger.info("Storage manager closed.")
+
+    _hcu_close._lmcache_hcu_close_patched = True
+    storage_manager_cls.close = _hcu_close
+
+
+def _patch_storage_manager_memcheck() -> None:
+    """Port GL 0.4.2-dcu StorageManager.memcheck: guard None allocator (inert MLA ranks)."""
+    logger.info("Apply HCU storage manager memcheck patch.")
+    try:
+        import lmcache.v1.storage_backend.storage_manager as storage_manager
+    except Exception as exc:
+        logger.warning("Skip StorageManager memcheck patch (import failed): %s", exc)
+        return
+
+    storage_manager_cls = storage_manager.StorageManager
+    original_memcheck = storage_manager_cls.memcheck
+    if getattr(original_memcheck, "_lmcache_hcu_memcheck_patched", False):
+        return
+
+    def _hcu_memcheck(self):
+        for backend in self.storage_backends.values():
+            if not isinstance(backend, storage_manager.AllocatorBackendInterface):
+                continue
+            memory_allocator = backend.get_memory_allocator()
+            if memory_allocator is not None and not memory_allocator.memcheck():
+                return False
+        return True
+
+    _hcu_memcheck._lmcache_hcu_memcheck_patched = True
+    storage_manager_cls.memcheck = _hcu_memcheck
+
+
+def _patch_gpu_memory_allocator_lifecycle() -> None:
+    """Port GL 0.4.2-dcu GPUMemoryAllocator close lifecycle and guards."""
+    logger.info("Apply HCU GPU memory allocator lifecycle patch.")
+    try:
+        import lmcache.v1.memory_management as memory_management
+    except Exception as exc:
+        logger.warning("Skip GPU allocator lifecycle patch (import failed): %s", exc)
+        return
+
+    gpu_cls = memory_management.GPUMemoryAllocator
+    if getattr(gpu_cls, "_lmcache_hcu_lifecycle_patched", False):
+        return
+
+    original_init = gpu_cls.__init__
+
+    def _hcu_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._closed = False
+
+    def _ensure_open(self):
+        if getattr(self, "_closed", False):
+            raise RuntimeError(f"{type(self).__name__} is closed")
+
+    def _release_gpu_pool(self):
+        if hasattr(self, "allocator"):
+            del self.allocator
+        if hasattr(self, "tensor"):
+            del self.tensor
+
+    original_allocate = gpu_cls.allocate
+    original_free = gpu_cls.free
+    original_batched_free = gpu_cls.batched_free
+
+    def _guarded_allocate(self, *args, **kwargs):
+        self._ensure_open()
+        return original_allocate(self, *args, **kwargs)
+
+    def _guarded_free(self, memory_obj, allocator_type=None):
+        with self.device_mem_lock:
+            if getattr(self, "_closed", False):
+                memory_obj.invalidate()
+                return
+            original_free(self, memory_obj, allocator_type)
+
+    def _guarded_batched_free(self, memory_objs, allocator_type=None, update_stats=True):
+        with self.device_mem_lock:
+            if getattr(self, "_closed", False):
+                for memory_obj in memory_objs:
+                    memory_obj.invalidate()
+                return
+            original_batched_free(self, memory_objs, allocator_type, update_stats)
+
+    gpu_cls.__init__ = _hcu_init
+    gpu_cls._ensure_open = _ensure_open
+    gpu_cls._release_gpu_pool = _release_gpu_pool
+    gpu_cls.allocate = _guarded_allocate
+    gpu_cls.free = _guarded_free
+    gpu_cls.batched_free = _guarded_batched_free
+    gpu_cls._lmcache_hcu_lifecycle_patched = True
+
+
 def apply_runtime_patches() -> None:
     global LMCACHE_HCU_PATCHED
     if LMCACHE_HCU_PATCHED:
@@ -785,17 +919,20 @@ def apply_runtime_patches() -> None:
     _patch_config()
     _patch_observability()
     _patch_xds_config()
+    _patch_gpu_memory_allocator_lifecycle()
     _patch_hyfile_memory_allocator()
     _patch_vllm_paged_mem_gpu_connector_v2()
     _patch_kv_layer_groups()
-    _patch_metadata_get_shapes()
     _patch_vllm_v1_adapter()
     _patch_hash_token()
     _patch_cache_controller_message()
+    _patch_pq_executor()
     _patch_storage_backends()
     _patch_local_disk_backend()
     _patch_storage_manager_allocate_and_copy_objects()
     _patch_storage_manager_touch_cache()
+    _patch_storage_manager_close()
+    _patch_storage_manager_memcheck()
     _patch_cache_engine()
     LMCACHE_HCU_PATCHED = True
 
