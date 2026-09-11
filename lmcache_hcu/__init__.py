@@ -750,24 +750,35 @@ def _patch_pq_executor() -> None:
     try:
         from lmcache.v1.storage_backend.job_executor.pq_executor import (
             AsyncPQExecutor,
-            AsyncPQThreadPoolExecutor,
         )
     except Exception as exc:
         logger.warning("Skip pq_executor patch (import failed): %s", exc)
         return
 
-    for cls in (AsyncPQExecutor, AsyncPQThreadPoolExecutor):
-        original_submit = cls.submit_job
-        if getattr(original_submit, "_lmcache_hcu_pq_closed_guard", False):
-            continue
+    # AsyncPQThreadPoolExecutor inherits submit_job from AsyncPQExecutor (it only
+    # overrides __init__/_worker/close), so patching the base covers both. The
+    # prior loop bound `original_submit` by name and, under the subclass
+    # iteration, cls.submit_job resolved via MRO to the already-patched base
+    # guard, so `original_submit` became the guard itself -> the guard called
+    # itself -> RecursionError on every put. Bind the original through a factory
+    # parameter so each guard captures its own copy by value, not by late
+    # binding.
+    original_submit = AsyncPQExecutor.submit_job
+    if getattr(original_submit, "_lmcache_hcu_pq_closed_guard", False):
+        return  # idempotent: already guarded (e.g. re-import)
 
+    def _make_guarded_submit(original):
         async def _guarded_submit_job(self, fn, *args, **kwargs):
             if getattr(self, "_closed", False):
                 raise RuntimeError("priority executor is closed")
-            return await original_submit(self, fn, *args, **kwargs)
+            return await original(self, fn, *args, **kwargs)
 
-        _guarded_submit_job._lmcache_hcu_pq_closed_guard = True
-        cls.submit_job = _guarded_submit_job
+        return _guarded_submit_job
+
+    guarded_submit = _make_guarded_submit(original_submit)
+    guarded_submit._lmcache_hcu_pq_closed_guard = True
+    guarded_submit.__wrapped__ = original_submit
+    AsyncPQExecutor.submit_job = guarded_submit
 
 
 def _patch_storage_manager_close() -> None:

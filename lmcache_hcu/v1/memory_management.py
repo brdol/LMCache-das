@@ -103,38 +103,18 @@ def patch_parent_allocator_semantics() -> None:
 
     mm.TensorMemoryAllocator.batched_allocate = tensor_batched_allocate
 
-    original_gpu_allocator_init = mm.GPUMemoryAllocator.__init__
-
-    @wraps(original_gpu_allocator_init)
-    def gpu_allocator_init(
-        self,
-        size,
-        device="cuda",
-        align_bytes=None,
-        use_paging=False,
-        **kwargs,
-    ):
-        original_gpu_allocator_init(
-            self,
-            size,
-            device=device,
-            align_bytes=align_bytes,
-            use_paging=use_paging,
-            **kwargs,
-        )
-        if use_paging:
-            return
-
-        tensor_allocator_kwargs = {}
-        if align_bytes is not None:
-            tensor_allocator_kwargs["align_bytes"] = align_bytes
-        self.allocator = mm.TensorMemoryAllocator(
-            self.tensor,
-            **tensor_allocator_kwargs,
-            parent_allocator=self,
-        )
-
-    mm.GPUMemoryAllocator.__init__ = gpu_allocator_init
+    # NOTE: GPUMemoryAllocator.__init__ is intentionally NOT patched here to
+    # inject parent_allocator=self. GL 0.4.2-dcu sets MemoryObj.parent_allocator
+    # to the inner TensorMemoryAllocator (inside TensorMemoryAllocator.allocate),
+    # so MemoryObj.__del__ -> free lands on TensorMemoryAllocator.free (address
+    # manager only -- no device_mem_lock). Injecting parent_allocator=self here
+    # (=GPUMemoryAllocator) routed __del__ -> GPUMemoryAllocator.free, which
+    # re-acquires the non-reentrant device_mem_lock while allocate already holds
+    # it (GC fires __del__ mid-allocate once the 8 GiB XDS pool fills under a long
+    # chunked prefill), deadlocking both TP workers. Leaving __init__ as baseline
+    # keeps parent_allocator on the inner TensorMemoryAllocator (via
+    # tensor_allocator_init's `parent_allocator if not None else self` fallback),
+    # matching GL.
 
     _PATCHED_PARENT_ALLOCATOR_SEMANTICS = True
 
