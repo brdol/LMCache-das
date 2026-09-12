@@ -7,6 +7,7 @@ import os
 import time
 
 from lmcache.logging import init_logger
+from lmcache.v1.cache_controller.message import OpType
 
 logger = init_logger(__name__)
 
@@ -51,6 +52,7 @@ def _hcu_load_bytes_from_disk(self, key, path, dtype, shape, fmt):
     buffer = memory_obj.byte_array
     if self.read_file(key, buffer, path):
         return memory_obj
+    memory_obj.ref_count_down()
     return None
 
 
@@ -80,42 +82,32 @@ def _hcu_read_file(self, key, buffer, path):
                 raise
     except FileNotFoundError:
         logger.warning(f"File not found on disk: {path}")
-        with self.disk_lock:
-            if self.dict.get(key, None):
-                self.dict.pop(key)
+        self.remove(key)
         return False
     except PermissionError:
         logger.warning(
             f"Failed to read from disk (permission denied): {path}"
         )
-        with self.disk_lock:
-            if self.dict.get(key, None):
-                self.dict.pop(key)
+        self.remove(key)
         return False
     except IsADirectoryError:
         logger.warning(
             f"Failed to read from disk (path is a directory): {path}"
         )
-        with self.disk_lock:
-            if self.dict.get(key, None):
-                self.dict.pop(key)
+        self.remove(key)
         return False
     except OSError as e:
         logger.warning(
             f"Failed to read from disk (OS error: {e}): {path}"
         )
-        with self.disk_lock:
-            if self.dict.get(key, None):
-                self.dict.pop(key)
+        self.remove(key)
         return False
     except Exception as e:
         logger.warning(
             f"Unexpected error reading from disk "
             f"({type(e).__name__}: {e}): {path}"
         )
-        with self.disk_lock:
-            if self.dict.get(key, None):
-                self.dict.pop(key)
+        self.remove(key)
         return False
 
     if bytes_read != size:
@@ -310,7 +302,7 @@ def _hcu_batched_async_load_bytes_from_disk(
     return loaded
 
 
-def _hcu_remove(self, key, force=True, remove_kv=True):
+def _hcu_remove(self, key, force=True):
     """Remove a key from the disk cache, debiting both size counters."""
     with self.disk_lock:
         meta = self.dict.get(key, None)
@@ -337,6 +329,12 @@ def _hcu_remove(self, key, force=True, remove_kv=True):
 
     if force:
         self.cache_policy.update_on_force_evict(key)
+
+    if self.batched_msg_sender is not None:
+        self.batched_msg_sender.add_kv_op(
+            op_type=OpType.EVICT,
+            key=key.chunk_hash,
+        )
     return True
 
 

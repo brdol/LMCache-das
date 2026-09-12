@@ -842,8 +842,6 @@ class XdsBackend(AllocatorBackendInterface):
             self.eviction = False
             logger.info(f"config.max_xds_size is None, don't suppot eviction")
 
-        # flag for extra assertions to catch bugs but harm performance
-        self._debug_asserts = False
         # flag to use O_NOATIME during metadata file read for performance improvement
         self._use_noatime = True
 
@@ -1214,7 +1212,6 @@ class XdsBackend(AllocatorBackendInterface):
         """
         Convert KV to bytes and async store bytes to storage.
         """
-        # logger.info(f"_async_save_bytes_to_storage {key}")
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
 
@@ -1281,8 +1278,6 @@ class XdsBackend(AllocatorBackendInterface):
                 shape = memory_obj.metadata.shape
                 dtype = memory_obj.metadata.dtype
                 self.hot_cache[key] = XDSCacheMetadata(path,size, shape, dtype)
-                # cache_size_mb = asizeof.asizeof(self.hot_cache) / 1024 / 1024
-                # logger.info(f"Hot cache size: {cache_size_mb:.2f} MB ({len(self.hot_cache)} entries)")
 
     async def _async_load_bytes_from_storage(
         self,
@@ -1457,17 +1452,11 @@ class XdsBackend(AllocatorBackendInterface):
                 xds_read_bytes += memory_obj.get_size()
             memory_objs.append(memory_obj)
 
-        start_time = time.perf_counter()
         results = list(
             self._thread_pool.map(
                 self._load_bytes_from_storage_with_memory, keys, paths, memory_objs
             )
         )
-        total_time = time.perf_counter() - start_time
-        # logger.info(
-        #     f"Time taken for batched_get_blocking: {total_time:.3f}s |"
-        #     f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
-        # )
         return results
 
     @_lmcache_nvtx_annotate
@@ -1607,12 +1596,6 @@ class XdsBackend(AllocatorBackendInterface):
             except OSError as e:
                 logger.error(f"Error removing {p} for {key}: {e}")
 
-        # # push kv evict msg
-        # if self.lmcache_worker is not None:
-        #     self.lmcache_worker.put_msg(
-        #         KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, str(self))
-        #     )
-
         return True
 
     def close(self) -> None:
@@ -1675,8 +1658,6 @@ class XdsBackend(AllocatorBackendInterface):
     ) -> Optional[MemoryObj]:
         if busy_loop:
             logger.warning("Xds Backend does not support allocation with busy loop")
-        # if eviction:
-        #     logger.warning("Xds Backend does not support eviction")
 
         if self.memory_allocator is None:  # MLA non-first-rank: inert
             return None
@@ -1693,8 +1674,6 @@ class XdsBackend(AllocatorBackendInterface):
     ) -> Optional[list[MemoryObj]]:
         if busy_loop:
             logger.warning("Xds Backend does not support allocation with busy loop")
-        # if eviction:
-        #     logger.warning("Xds Backend does not support eviction")
 
         if self.memory_allocator is None:  # MLA non-first-rank: inert
             return None

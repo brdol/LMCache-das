@@ -67,7 +67,7 @@ class GdsBackend(_BaseGdsBackend):
                 PermissionError,
                 AttributeError,
                 OSError,
-            ):  # fallback to normal open if O_NOATIME is not supportedExpand commentComment on lines R365 to R372Resolved
+            ):
                 self._use_noatime = False
                 logger.info(
                     "O_NOATIME flag not supported during metadata file read, "

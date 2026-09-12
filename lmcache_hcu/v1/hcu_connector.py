@@ -302,12 +302,8 @@ class VLLMPagedMemHCUConnectorV2(GPUConnectorInterface):
             head_size = self.kvcaches[0][0].shape[3]
             block_size = self.kvcaches[0][0].shape[2]
 
-            #logger.info(f"VLLMPagedMemHCUConnectorV2 from gpu, start = {start}, end = {end}, gpu_buffer.shape = {self.gpu_buffer.shape}")
-            #logger.info(f"num_heads: {num_heads}, head_size: {head_size}, block_size: {block_size}")
-            #logger.info(f"slot_mapping: {slot_mapping}")
             with torch.cuda.stream(self.store_stream):
                 if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-                    #logger.info(f"lmc_ops.multi_layer_kv_transfer from_gpu, memory_obj.tensor.shape: {memory_obj.tensor.shape} ")
                     lmc_ops.multi_layer_kv_transfer_asymmetric(
                         memory_obj.tensor,
                         key_cache_pointers,
@@ -322,7 +318,6 @@ class VLLMPagedMemHCUConnectorV2(GPUConnectorInterface):
                 else:
                     # kvcaches -> gpu_buffer -> memobj
                     assert self.gpu_buffer.device == self.kvcaches[0][0].device
-                    #logger.info(f"lmc_ops.multi_layer_kv_transfer kvcaches -> gpu_buffer -> memobj")
                     tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                     lmc_ops.multi_layer_kv_transfer_asymmetric(
                         tmp_gpu_buffer,
@@ -400,15 +395,6 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         use_double_buffer: bool = True,
         **kwargs,
     ):
-        # logger.debug(
-        #     "Using HCU VLLMBufferLayerwiseGPUConnector: "
-        #     "hidden_dim_size=%s, num_layers=%s, use_gpu=%s, "
-        #     "use_double_buffer=%s",
-        #     hidden_dim_size,
-        #     num_layers,
-        #     use_gpu,
-        #     use_double_buffer,
-        # )
         self.hidden_dim_size = hidden_dim_size
         self.num_layers = num_layers
 
@@ -710,7 +696,6 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        # logger.debug(f"batched_from_gpu enter.")
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -831,14 +816,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self.store_stream = torch.cuda.Stream()
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
-        # logger.debug(
-        #     "Using HCU VLLMPagedMemLayerwiseGPUConnector: "
-        #     "hidden_dim_size=%s, num_layers=%s, use_gpu=%s, use_mla=%s",
-        #     self.hidden_dim_size,
-        #     self.num_layers,
-        #     self.use_gpu,
-        #     self.use_mla,
-        # )
 
     @classmethod
     def from_metadata(

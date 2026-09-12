@@ -556,7 +556,12 @@ def _patch_storage_backends() -> None:
             config, metadata, loop, dst_device, lmcache_worker,
             skip_backends, existing_backends,
         )
-        if getattr(config, "xds_path", None) is None or "XdsBackend" in backends:
+        if (
+            getattr(config, "xds_path", None) is None
+            or "XdsBackend" in backends
+            or (skip_backends is not None and "XdsBackend" in skip_backends)
+            or not storage_backend.is_cuda_worker(metadata)
+        ):
             return backends
 
         actual_dst_device = dst_device
@@ -891,19 +896,22 @@ def _patch_gpu_memory_allocator_lifecycle() -> None:
             del self.tensor
 
     original_allocate = gpu_cls.allocate
-    original_free = gpu_cls.free
-    original_batched_free = gpu_cls.batched_free
+    original_batched_allocate = gpu_cls.batched_allocate
 
     def _guarded_allocate(self, *args, **kwargs):
         self._ensure_open()
         return original_allocate(self, *args, **kwargs)
+
+    def _guarded_batched_allocate(self, *args, **kwargs):
+        self._ensure_open()
+        return original_batched_allocate(self, *args, **kwargs)
 
     def _guarded_free(self, memory_obj, allocator_type=None):
         with self.device_mem_lock:
             if getattr(self, "_closed", False):
                 memory_obj.invalidate()
                 return
-            original_free(self, memory_obj, allocator_type)
+            self.allocator.free(memory_obj, allocator_type)
 
     def _guarded_batched_free(self, memory_objs, allocator_type=None, update_stats=True):
         with self.device_mem_lock:
@@ -911,12 +919,13 @@ def _patch_gpu_memory_allocator_lifecycle() -> None:
                 for memory_obj in memory_objs:
                     memory_obj.invalidate()
                 return
-            original_batched_free(self, memory_objs, allocator_type, update_stats)
+            self.allocator.batched_free(memory_objs, allocator_type, update_stats)
 
     gpu_cls.__init__ = _hcu_init
     gpu_cls._ensure_open = _ensure_open
     gpu_cls._release_gpu_pool = _release_gpu_pool
     gpu_cls.allocate = _guarded_allocate
+    gpu_cls.batched_allocate = _guarded_batched_allocate
     gpu_cls.free = _guarded_free
     gpu_cls.batched_free = _guarded_batched_free
     gpu_cls._lmcache_hcu_lifecycle_patched = True

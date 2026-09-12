@@ -3,7 +3,9 @@
 # Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import wraps
+import threading
 
 import torch
 
@@ -120,16 +122,35 @@ def patch_parent_allocator_semantics() -> None:
 
 
 class HyFileMemoryAllocator(GPUMemoryAllocator):
+    _lifecycle_lock = threading.Lock()
+    _active_allocators = 0
+
     def __init__(self, size: int, use_mla: bool = False, device=None):
         patch_parent_allocator_semantics()
-        HIPFile.init_driver()
-
-        if device is None:
-            device = f"cuda:{torch.cuda.current_device()}"
-
-        super().__init__(size, device, align_bytes=4096)
-        self.base_pointer = self.tensor.data_ptr()
-        HIPFile.register_global_buffer(self.base_pointer, size)
+        self._closed = True
+        self._registered = False
+        self._counted = False
+        with HyFileMemoryAllocator._lifecycle_lock:
+            opens_driver = HyFileMemoryAllocator._active_allocators == 0
+            try:
+                if opens_driver:
+                    HIPFile.init_driver()
+                if device is None:
+                    device = f"cuda:{torch.cuda.current_device()}"
+                super().__init__(size, device, align_bytes=4096)
+                self.base_pointer = self.tensor.data_ptr()
+                HIPFile.register_global_buffer(self.base_pointer, size)
+                self._registered = True
+                self._counted = True
+                HyFileMemoryAllocator._active_allocators += 1
+            except BaseException:
+                self._release_gpu_pool()
+                if opens_driver:
+                    try:
+                        HIPFile.close_driver()
+                    except Exception:
+                        logger.exception("Failed to roll back the HyFile driver")
+                raise
         logger.info(
             "Registering HyFile buffer at address %s with size %s",
             self.base_pointer,
@@ -138,10 +159,28 @@ class HyFileMemoryAllocator(GPUMemoryAllocator):
 
     def __del__(self):
         try:
-            HIPFile.deregister_global_buffer(self.base_pointer)
-            HIPFile.close_driver()
+            self.close()
         except Exception:
-            pass
+            logger.exception("Failed to close HyFileMemoryAllocator")
+
+    def close(self):
+        with HyFileMemoryAllocator._lifecycle_lock:
+            device_lock = getattr(self, "device_mem_lock", nullcontext())
+            with device_lock:
+                registered = getattr(self, "_registered", False)
+                counted = getattr(self, "_counted", False)
+                if getattr(self, "_closed", True) and not registered and not counted:
+                    return
+                self._closed = True
+                if registered:
+                    HIPFile.deregister_global_buffer(self.base_pointer)
+                    self._registered = False
+                if counted:
+                    if HyFileMemoryAllocator._active_allocators == 1:
+                        HIPFile.close_driver()
+                    HyFileMemoryAllocator._active_allocators -= 1
+                    self._counted = False
+                self._release_gpu_pool()
 
     def __str__(self):
         return "HyFileMemoryAllocator"
