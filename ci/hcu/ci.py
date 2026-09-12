@@ -333,7 +333,7 @@ def cmd_verify_wheel(args: argparse.Namespace) -> int:
             raise CIError("Wheel metadata does not contain a version")
         version = version_match.group(1).strip()
         version_match = re.fullmatch(
-            r"0\.3\.13\+hcu\.\d{10}\.([0-9a-f]{7,40})", version
+            r"0\.4\.2\+hcu\.\d{10}\.([0-9a-f]{7,40})", version
         )
         built_sha = version_match.group(1) if version_match else ""
         if not version_match or not args.sha.startswith(built_sha):
@@ -493,8 +493,8 @@ def cmd_patch_gate(args: argparse.Namespace) -> int:
         manifest = read_json(args.manifest)
         upstream = Path(args.upstream).resolve()
         lmcache_version = importlib.metadata.version("lmcache")
-        if base_version(lmcache_version) != "0.3.13":
-            raise CIError(f"Expected LMCache 0.3.13, got {lmcache_version}")
+        if base_version(lmcache_version) != "0.4.2":
+            raise CIError(f"Expected LMCache 0.4.2, got {lmcache_version}")
         targets: list[dict[str, object]] = []
         for declaration in manifest["targets"]:
             target = module_file(declaration["module"])

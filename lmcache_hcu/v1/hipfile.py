@@ -288,9 +288,6 @@ class HIPfileException(Exception):
     def __init__(self, error: HIPfileError_t, message: str = ""):
         self.error_code = error.err
         self.hip_error = error.hip_err
-        
-        # Get detailed error message
-        print(error.err)
         if message:
             self.message = message
         else:

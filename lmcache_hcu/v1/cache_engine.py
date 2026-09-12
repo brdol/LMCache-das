@@ -153,8 +153,9 @@ class LMCacheEngine:
         for key, memory_obj, _, _ in reordered_chunks:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
-                self.storage_manager.remove(key)
-            memory_obj.ref_count_down()
+                self.storage_manager.remove(key, self.retrieve_locations)
+            if not self.async_loading:
+                memory_obj.ref_count_down()
 
         onload_time = retrieve_stats.time_to_retrieve() if retrieve_stats else (time.perf_counter() - t)
 
@@ -242,8 +243,6 @@ class LMCacheEngineBuilder:
         metadata: LMCacheMetadata,
         numa_mapping: Optional[NUMAMapping] = None,
     ) -> MemoryAllocatorInterface:
-        # NOTE: should remove this function after fixing the unit tests:
-        # raise RuntimeError("_Create_memory_allocator is deprecated!")
         extra_config = config.extra_config
         enable_nixl_storage = extra_config is not None and extra_config.get(
             "enable_nixl_storage"
