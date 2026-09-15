@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 """Trusted pytest support for the LMCache HCU CI environment.
 
 The upstream v0.4.2 ``lmserver_v1_process`` fixture allows only fifteen

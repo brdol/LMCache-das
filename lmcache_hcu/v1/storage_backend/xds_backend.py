@@ -293,7 +293,7 @@ class CliStorageInterface(ABC):
 
 
 class HyFileDDS(CliStorageInterface):
-    """Hygon DCU HyFile DDS 实现"""
+    """Hygon HCU HyFile DDS 实现"""
 
     # hipfile DMA transfers are NOT thread-safe: concurrent hipFileWrite calls
     # from the put-executor workers corrupt each other's payloads (observed

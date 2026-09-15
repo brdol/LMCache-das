@@ -5,7 +5,7 @@
 
 These tests mirror the upstream KVLayerGroupsManager coverage, but call the
 HCU-patched API (no use_mla argument) and cover the HCU custom flash-attn
-skip and DCU tuple KV shape synthesis.
+skip and HCU tuple KV shape synthesis.
 """
 from __future__ import annotations
 
@@ -163,10 +163,10 @@ class TestKVLayerGroupsManager:
         assert manager.kv_layer_groups[1].layer_names == ["layer_1"]
         assert manager.kv_layer_groups[1].layer_indices == [2]
 
-    def test_build_kv_layer_groups_dcu_tuple_kv_synthesizes_canonical_shape(
+    def test_build_kv_layer_groups_hcu_tuple_kv_synthesizes_canonical_shape(
         self, monkeypatch
     ):
-        """DCU vLLM (K,V) tuple layers should be grouped by synthesized 5D shape."""
+        """HCU vLLM (K,V) tuple layers should be grouped by synthesized 5D shape."""
         _set_custom_flash_attn(monkeypatch, False)
         manager = KVLayerGroupsManager()
         nb, nh, bs, hs = 32, 8, 256, 64
