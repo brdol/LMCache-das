@@ -63,8 +63,8 @@ def _version() -> str:
     build_date = _build_date()
     suffix = _git_sha()
     if suffix == "unknown":
-        return f"0.3.13+hcu.{build_date}"
-    return f"0.3.13+hcu.{build_date}.{suffix}"
+        return f"0.4.2+hcu.{build_date}"
+    return f"0.4.2+hcu.{build_date}.{suffix}"
 
 
 def _flag_cxx_abi() -> str:
