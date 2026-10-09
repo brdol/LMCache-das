@@ -617,6 +617,20 @@ def _patch_cache_engine() -> None:
     hcu_create_memory_allocator = (
         hcu_cache_engine.LMCacheEngineBuilder._Create_memory_allocator
     )
+    hcu_store = hcu_cache_engine.LMCacheEngine.store
+    hcu_process_tokens_internal = (
+        hcu_cache_engine.LMCacheEngine._process_tokens_internal
+    )
+
+    if not getattr(engine_cls.store, "_lmcache_hcu_patched", False):
+        hcu_store._lmcache_hcu_patched = True
+        engine_cls.store = hcu_store
+
+    if not getattr(
+        engine_cls._process_tokens_internal, "_lmcache_hcu_patched", False
+    ):
+        hcu_process_tokens_internal._lmcache_hcu_patched = True
+        engine_cls._process_tokens_internal = hcu_process_tokens_internal
 
     if not getattr(engine_cls.retrieve, "_lmcache_hcu_patched", False):
         hcu_retrieve._lmcache_hcu_patched = True
@@ -655,88 +669,6 @@ def _patch_local_disk_backend() -> None:
 
     patch_local_disk_backend(local_disk_backend)
 
-def _patch_storage_manager_allocate_and_copy_objects() -> None:
-    logger.info("Apply HCU storage manager allocate_and_copy_objects patch.")
-    try:
-        import lmcache.v1.storage_backend.storage_manager as storage_manager
-    except Exception as exc:
-        logger.warning(
-            "Skip StorageManager allocate_and_copy_objects patch (import failed): %s",
-            exc,
-        )
-        return
-
-    original_allocate_and_copy_objects = storage_manager.allocate_and_copy_objects
-    if getattr(
-        original_allocate_and_copy_objects,
-        "_lmcache_hcu_allocated_keys_patched",
-        False,
-    ):
-        return
-
-    def allocate_and_copy_objects_with_allocated_keys(
-            allocator_backend,
-            keys,
-            src_memory_objs,
-            stream,
-    ):
-        """Return the keys that were actually allocated with copied objects."""
-        allocated_keys = []
-        allocated_objects = []
-        for key, src_memory_obj in zip(keys, src_memory_objs, strict=False):
-            if allocator_backend.contains(key):
-                continue
-            memory_obj = allocator_backend.allocate(
-                src_memory_obj.get_shape(),
-                src_memory_obj.get_dtype(),
-                fmt=src_memory_obj.meta.fmt,
-                eviction=True,
-                busy_loop=False,
-            )
-
-            if memory_obj is None:
-                break
-
-            if memory_obj.tensor is None:
-                logger.warning(
-                    "Allocated MemoryObj has None tensor, this is unexpected. "
-                    "Releasing the memory object."
-                )
-                memory_obj.ref_count_down()
-                break
-
-            with torch.cuda.stream(stream):
-                memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
-            allocated_keys.append(key)
-            allocated_objects.append(memory_obj)
-
-        stream.synchronize()
-        return allocated_keys, allocated_objects
-
-    allocate_and_copy_objects_with_allocated_keys._lmcache_hcu_allocated_keys_patched = True
-    storage_manager.allocate_and_copy_objects = allocate_and_copy_objects_with_allocated_keys
-
-
-def _patch_storage_manager_touch_cache() -> None:
-    logger.info("Apply HCU storage manager touch_cache patch.")
-    try:
-        import lmcache.v1.storage_backend.storage_manager as storage_manager
-    except Exception as exc:
-        logger.warning("Skip StorageManager touch_cache patch (import failed): %s", exc)
-        return
-
-    storage_manager_cls = storage_manager.StorageManager
-    original_touch_cache = storage_manager_cls.touch_cache
-    if getattr(original_touch_cache, "_lmcache_hcu_xds_patched", False):
-        return
-
-    def touch_cache_with_xds(self):
-        for backend_name, backend in self.storage_backends.items():
-            if backend_name in ("LocalCPUBackend", "LocalDiskBackend", "XdsBackend"):
-                backend.touch_cache()
-
-    touch_cache_with_xds._lmcache_hcu_xds_patched = True
-    storage_manager_cls.touch_cache = touch_cache_with_xds
 
 
 def _patch_pq_executor() -> None:
@@ -767,88 +699,10 @@ def _patch_pq_executor() -> None:
     AsyncPQExecutor.submit_job = guarded_submit
 
 
-def _patch_storage_manager_close() -> None:
-    """Port GL 0.4.2-dcu StorageManager.close: reverse-order + re-raise first error."""
-    logger.info("Apply HCU storage manager close patch.")
-    try:
-        import lmcache.v1.storage_backend.storage_manager as storage_manager
-    except Exception as exc:
-        logger.warning("Skip StorageManager close patch (import failed): %s", exc)
-        return
-
-    storage_manager_cls = storage_manager.StorageManager
-    original_close = storage_manager_cls.close
-    if getattr(original_close, "_lmcache_hcu_close_patched", False):
-        return
-
-    def _hcu_close(self):
-        logger.info("Closing StorageManager...")
-        close_error = None
-        shared_allocator_backends = {"LocalCPUBackend", "PDBackend"}
-        for name, backend in reversed(self.storage_backends.items()):
-            if close_error is not None and name in shared_allocator_backends:
-                logger.warning(
-                    "Skipping close of shared allocator backend %s after an "
-                    "earlier close failure",
-                    name,
-                )
-                continue
-            try:
-                logger.info(f"Closing storage backend: {name}")
-                backend.close()
-                logger.info(f"Storage backend {name} closed successfully")
-            except Exception as e:
-                logger.error(f"Error closing backend {name}: {e}")
-                if close_error is None:
-                    close_error = e
-
-        try:
-            if self.loop.is_running():
-                self.loop.call_soon_threadsafe(self.loop.stop)
-        except Exception as e:
-            logger.error(f"Error stopping event loop: {e}")
-
-        if self.thread.is_alive():
-            self.thread.join(timeout=10.0)
-
-        if close_error is not None:
-            raise close_error
-
-        logger.info("Storage manager closed.")
-
-    _hcu_close._lmcache_hcu_close_patched = True
-    storage_manager_cls.close = _hcu_close
-
-
-def _patch_storage_manager_memcheck() -> None:
-    """Port GL 0.4.2-dcu StorageManager.memcheck: guard None allocator (inert MLA ranks)."""
-    logger.info("Apply HCU storage manager memcheck patch.")
-    try:
-        import lmcache.v1.storage_backend.storage_manager as storage_manager
-    except Exception as exc:
-        logger.warning("Skip StorageManager memcheck patch (import failed): %s", exc)
-        return
-
-    storage_manager_cls = storage_manager.StorageManager
-    original_memcheck = storage_manager_cls.memcheck
-    if getattr(original_memcheck, "_lmcache_hcu_memcheck_patched", False):
-        return
-
-    def _hcu_memcheck(self):
-        for backend in self.storage_backends.values():
-            if not isinstance(backend, storage_manager.AllocatorBackendInterface):
-                continue
-            memory_allocator = backend.get_memory_allocator()
-            if memory_allocator is not None and not memory_allocator.memcheck():
-                return False
-        return True
-
-    _hcu_memcheck._lmcache_hcu_memcheck_patched = True
-    storage_manager_cls.memcheck = _hcu_memcheck
 
 
 def _patch_gpu_memory_allocator_lifecycle() -> None:
-    """Port GL 0.4.2-dcu GPUMemoryAllocator close lifecycle and guards."""
+    """Patch the GPU memory allocator close lifecycle and guards."""
     logger.info("Apply HCU GPU memory allocator lifecycle patch.")
     try:
         import lmcache.v1.memory_management as memory_management
@@ -912,6 +766,111 @@ def _patch_gpu_memory_allocator_lifecycle() -> None:
     gpu_cls._lmcache_hcu_lifecycle_patched = True
 
 
+
+def _patch_hcu_xds_nobuffer() -> None:
+    """Wire the HCU XDS no-buffer (block-first / direct-IO) modules.
+
+    Replaces the upstream modules in `sys.modules` so that any later import
+    resolves to the HCU implementation (same mechanism as
+    `_patch_storage_backends`).
+    """
+    logger.info("Apply HCU XDS no-buffer (block-first/direct-IO) patches.")
+    import importlib
+
+    try:
+        import lmcache.integration.vllm.vllm_v1_adapter as _upstream_adapter
+        from lmcache_hcu.integration.vllm.vllm_v1_adapter import (
+            LMCacheConnectorV1Impl as _HCUConnectorV1Impl,
+        )
+
+        _upstream_adapter.LMCacheConnectorV1Impl.register_cross_layers_kv_cache = (
+            _HCUConnectorV1Impl.register_cross_layers_kv_cache
+        )
+        _upstream_adapter.LMCacheConnectorV1Impl._init_connector_state = (
+            _HCUConnectorV1Impl._init_connector_state
+        )
+        _upstream_adapter.LMCacheConnectorV1Impl._get_engine_kvcaches = (
+            _HCUConnectorV1Impl._get_engine_kvcaches
+        )
+        _upstream_adapter.LMCacheConnectorV1Impl.start_load_kv = (
+            _HCUConnectorV1Impl.start_load_kv
+        )
+        _upstream_adapter.LMCacheConnectorV1Impl.wait_for_save = (
+            _HCUConnectorV1Impl.wait_for_save
+        )
+        from lmcache_hcu.integration.vllm._hcu_wait_for_save_patch import (
+            patch_wait_for_save as _reinstall_wait_for_save_patch,
+        )
+
+        _reinstall_wait_for_save_patch(_upstream_adapter)
+        import lmcache_hcu.integration.vllm.vllm_v1_adapter as _hcu_adapter_module
+
+        for _name in (
+            "LMCacheConnectorMetadata",
+            "LoadSpec",
+            "SaveSpec",
+            "DisaggSpec",
+            "ReqMeta",
+            "RequestTracker",
+        ):
+            _upstream_cls = getattr(_upstream_adapter, _name, None)
+            if _upstream_cls is not None:
+                setattr(_hcu_adapter_module, _name, _upstream_cls)
+        logger.info(
+            "Install HCU cross-layer adapter hooks on the upstream adapter class."
+        )
+    except Exception as exc:
+        logger.warning("Skip cross-layer adapter hooks: %s", exc)
+
+    targets = [
+        ("lmcache.v1.metadata", "lmcache_hcu.v1.metadata"),
+        ("lmcache.v1.storage_backend.block_first_disk", "lmcache_hcu.v1.storage_backend.block_first_disk"),
+        ("lmcache.v1.storage_backend.direct_io", "lmcache_hcu.v1.storage_backend.direct_io"),
+        ("lmcache.v1.storage_backend.storage_manager", "lmcache_hcu.v1.storage_backend.storage_manager"),
+        ("lmcache.v1.storage_backend.xds_backend", "lmcache_hcu.v1.storage_backend.xds_backend"),
+        ("lmcache.v1.gpu_connector.gpu_connectors", "lmcache_hcu.v1.gpu_connector.gpu_connectors"),
+        ("lmcache.v1.gpu_connector.utils", "lmcache_hcu.v1.gpu_connector.utils"),
+        ("lmcache.v1.manager", "lmcache_hcu.v1.manager"),
+        ("lmcache.integration.vllm.lmcache_connector_v1", "lmcache_hcu.integration.vllm.lmcache_connector_v1"),
+        ("lmcache.integration.vllm.utils", "lmcache_hcu.integration.vllm.utils"),
+    ]
+    swapped = []
+    for src_name, hcu_name in targets:
+        try:
+            hcu_mod = importlib.import_module(hcu_name)
+        except Exception as exc:
+            logger.warning("Skip %s patch (import %s failed): %s", src_name, hcu_name, exc)
+            continue
+        sys.modules[src_name] = hcu_mod
+        swapped.append(src_name)
+        parent_name, _, leaf = src_name.rpartition(".")
+        try:
+            setattr(importlib.import_module(parent_name), leaf, hcu_mod)
+        except Exception as exc:
+            logger.warning("Skip attribute binding %s.%s: %s", parent_name, leaf, exc)
+
+    replaced = set(swapped)
+    rebound = 0
+    for mod in list(sys.modules.values()):
+        mod_name = getattr(mod, "__name__", None)
+        if not mod_name or not mod_name.startswith(("lmcache.", "lmcache_hcu.")):
+            continue
+        if mod_name in replaced:
+            continue
+        for attr, value in list(vars(mod).items()):
+            try:
+                owner = getattr(value, "__module__", None)
+            except Exception:
+                continue
+            if owner in replaced:
+                replacement = getattr(sys.modules[owner], attr, None)
+                if replacement is not None:
+                    setattr(mod, attr, replacement)
+                    rebound += 1
+    logger.info(
+        "Rebound %d stale references left over from the pre-swap imports.", rebound
+    )
+
 def apply_runtime_patches() -> None:
     global LMCACHE_HCU_PATCHED
     if LMCACHE_HCU_PATCHED:
@@ -928,12 +887,9 @@ def apply_runtime_patches() -> None:
     _patch_hash_token()
     _patch_cache_controller_message()
     _patch_pq_executor()
+    _patch_hcu_xds_nobuffer()
     _patch_storage_backends()
     _patch_local_disk_backend()
-    _patch_storage_manager_allocate_and_copy_objects()
-    _patch_storage_manager_touch_cache()
-    _patch_storage_manager_close()
-    _patch_storage_manager_memcheck()
     _patch_cache_engine()
     LMCACHE_HCU_PATCHED = True
 

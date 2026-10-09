@@ -302,14 +302,22 @@ def _hcu_batched_async_load_bytes_from_disk(
 
 
 def _hcu_remove(self, key, force=True):
-    """Remove a key from the disk cache, debiting both size counters."""
-    with self.disk_lock:
+    """Remove a key from the disk cache.
+
+    ``force=True`` debits both ``current_cache_size`` and ``usage``; the
+    eviction path passes ``force=False`` and has already debited
+    ``current_cache_size`` itself, so only ``usage`` is debited here.
+    """
+    if force:
+        self.disk_lock.acquire()
+    try:
         meta = self.dict.get(key, None)
         if meta is None:
             return False
 
         path = meta.path
-        self.current_cache_size -= meta.size
+        if force:
+            self.current_cache_size -= meta.size
         if meta.shape is not None and meta.dtype is not None:
             payload_size = meta.shape.numel() * meta.dtype.itemsize
         else:
@@ -318,6 +326,9 @@ def _hcu_remove(self, key, force=True):
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         self.dict.pop(key)
+    finally:
+        if force:
+            self.disk_lock.release()
 
     try:
         os.remove(path)

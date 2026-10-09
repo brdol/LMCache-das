@@ -195,13 +195,19 @@ __global__ void single_layer_kv_transfer_kernel(
 
 template <GPUKVFormat format>
 __device__ __forceinline__ int64_t
-page_buffer_offset(const int k_or_v, const int token_idx,
+page_buffer_offset(const int k_or_v, const int64_t token_idx,
                    const int scalar_offset, const int scalars_per_token,
-                   const int page_buffer_size, const int block_size) {
+                   const int num_layers, const int page_buffer_size,
+                   const int block_size) {
   // vllm cross layer
   if constexpr (format == GPUKVFormat::NB_NL_TWO_BS_NH_HS) {
-    return k_or_v * page_buffer_size * scalars_per_token +
-           token_idx * scalars_per_token + scalar_offset;
+    const int64_t block_idx = token_idx / block_size;
+    const int64_t block_offset = token_idx % block_size;
+
+    return (block_idx * static_cast<int64_t>(num_layers) * 2 * block_size +
+            static_cast<int64_t>(k_or_v) * block_size + block_offset) *
+              scalars_per_token +
+          scalar_offset;
   }
   // vllm flash attention
   else if constexpr (format == GPUKVFormat::NL_X_TWO_NB_BS_NH_HS) {
@@ -354,8 +360,9 @@ __global__ void load_and_reshape_multi_layer_kernel(
         key_value_offset(k_or_v, layer_id, kv_token_id, i, scalars_per_token,
                          num_tokens, num_layers);
 
-    const int64_t vllm_offset = page_buffer_offset<format>(
-        k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size);
+    const int64_t vllm_offset =
+        page_buffer_offset<format>(k_or_v, slot_idx, i, scalars_per_token,
+                                  num_layers, page_buffer_size, block_size);
 
     if (DIRECTION)  // 1 is paged buffer to LMCache
       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
