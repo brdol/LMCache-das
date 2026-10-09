@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modifications Copyright 2026 Hygon Information Technology Co., Ltd.
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
